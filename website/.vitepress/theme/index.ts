@@ -4,6 +4,7 @@ import type { Theme } from 'vitepress';
 import { useRoute } from 'vitepress';
 import { nextTick, onMounted, watch } from 'vue';
 import mediumZoom, { type Zoom } from 'medium-zoom';
+import { inject } from '@vercel/analytics';
 import '@fontsource/bricolage-grotesque/400.css';
 import '@fontsource/bricolage-grotesque/500.css';
 import '@fontsource/bricolage-grotesque/600.css';
@@ -22,6 +23,8 @@ const theme: Theme = {
   extends: DefaultTheme,
   enhanceApp({ app }) {
     app.component('KIcon', KIcon);
+    // Initialize Vercel Analytics
+    inject();
   },
   setup() {
     const route = useRoute();
