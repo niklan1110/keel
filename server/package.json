@@ -23,6 +23,6 @@
     "@types/nodemailer": "^8.0.2",
     "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.2",
-    "typescript": "~5.9"
+    "typescript": "~7.0"
   }
 }
