@@ -1,0 +1,11 @@
+# Everything is stored and checked out with LF line endings, on every platform:
+# the shell scripts and SQL run inside Linux containers, and CRLF breaks them.
+* text=auto eol=lf
+# Except Windows batch files, which cmd.exe reads reliably only with CRLF.
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.woff2 binary

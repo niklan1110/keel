@@ -1,0 +1,593 @@
+# Keel: self-hosted Postgres backend with REST, auth, storage, realtime and edge functions.
+#
+#   ./keel init      # writes .env with fresh secrets
+#   ./keel up        # builds and starts the stack
+#
+# Studio:  http://<host>:3000     API gateway: http://<host>:8000/<project>
+
+name: keel
+
+# Docker keeps at most 30 MB of logs per container.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-keel: &keel
+  image: ${KEEL_IMAGE:-keel:local}
+  # Built (or pulled) once by keel-migrate; the other services reuse it.
+  pull_policy: never
+  init: true
+  restart: unless-stopped
+  logging: *logging
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  depends_on:
+    keel-migrate:
+      condition: service_completed_successfully
+  # Only keel-migrate and keel-studio get the Postgres superuser password and
+  # KEEL_SERVICE_PASSWORD. keel-migrate derives a password for each service
+  # role from it and leaves each in a volume of its own (x-credentials); the
+  # other services mount only their role's volume.
+  environment: &keel-env
+    KEEL_DB_HOST: keel-db
+    KEEL_PUBLIC_URL: ${KEEL_PUBLIC_URL:-http://localhost:8000}
+    # internet, lan, or empty to judge from KEEL_PUBLIC_URL (sign-up defaults of new projects).
+    KEEL_EXPOSURE: ${KEEL_EXPOSURE:-}
+    KEEL_PUBLIC_DB_PORT: ${KEEL_DB_PORT:-5432}
+    KEEL_LOG_LEVEL: ${KEEL_LOG_LEVEL:-info}
+    # Email addresses, phone numbers and full request paths in the logs (on/off). Links and codes never are.
+    KEEL_LOG_PII: ${KEEL_LOG_PII:-off}
+    TZ: ${TZ:-UTC}
+    # What counts as "your network" (LAN, Tailscale, this machine).
+    KEEL_LOCAL_NETWORKS: ${KEEL_LOCAL_NETWORKS:-private}
+    # Proxies whose X-Forwarded-For is believed besides Keel's own (see the docs).
+    KEEL_TRUSTED_PROXIES: ${KEEL_TRUSTED_PROXIES:-}
+    # Limits against slow or flooding clients (empty = the defaults in the docs).
+    KEEL_BODY_IDLE_TIMEOUT: ${KEEL_BODY_IDLE_TIMEOUT:-}
+    KEEL_MAX_CONNECTIONS_PER_IP: ${KEEL_MAX_CONNECTIONS_PER_IP:-}
+    KEEL_REALTIME_MAX_PER_IP: ${KEEL_REALTIME_MAX_PER_IP:-}
+    KEEL_REALTIME_MAX_PER_PROJECT: ${KEEL_REALTIME_MAX_PER_PROJECT:-}
+    # Studio sign-ins from the internet: 2fa (only with two-factor), on or off.
+    KEEL_STUDIO_INTERNET_LOGIN: ${KEEL_STUDIO_INTERNET_LOGIN:-2fa}
+
+# Older .env files without KEEL_SERVICE_PASSWORD keep using POSTGRES_PASSWORD.
+x-service-password: &service-password ${KEEL_SERVICE_PASSWORD:-${POSTGRES_PASSWORD:?Run ./keel init to create a .env file}}
+
+# Starts Postgres with a pg_hba.conf written on every start:
+#   - inside the keel-db container: no password (as in the stock image)
+#   - from Keel's own Docker networks ("samenet"): password (SCRAM). This also
+#     covers this machine connecting to the published port, which Docker
+#     forwards from the network's gateway address.
+#   - from anywhere else: TLS and password only, never as one of Keel's own
+#     service roles, and never as the postgres superuser unless
+#     KEEL_DB_REMOTE_SUPERUSER=on.
+# KEEL_DB_GATEWAY=remote treats connections from the network's gateway as
+# remote, for Docker Desktop, rootless Docker and Podman, where every outside
+# client arrives from there (the installer and ./keel init --lan-db set it).
+# KEEL_DB_LOCAL_NETWORKS replaces "samenet" with your own list of CIDRs.
+# KEEL_DB_SETTINGS adds Postgres settings (see docker-compose.small.yml).
+x-db-start: &db-start |
+  set -eu
+  hba=/var/run/postgresql/keel_hba.conf
+  service_roles=authenticator,keel_auth_admin,keel_storage_admin,keel_realtime_admin,keel_functions_admin,keel_egress_admin
+  # The host's ends of this container's Docker networks, from the routing
+  # table (hex, lowest byte first): every gateway, and the first address of
+  # every directly connected network.
+  host_ends() {
+    awk 'function b(s) { return index("0123456789abcdef", tolower(substr(s, 1, 1))) * 16 + index("0123456789abcdef", tolower(substr(s, 2, 1))) - 17 }
+      function ip(x, add) { return b(substr(x, 7, 2)) "." b(substr(x, 5, 2)) "." b(substr(x, 3, 2)) "." (b(substr(x, 1, 2)) + add) }
+      NR > 1 && $$3 != "00000000" { print ip($$3, 0) }
+      NR > 1 && $$2 != "00000000" && $$3 == "00000000" { print ip($$2, 1) }' /proc/net/route | sort -u
+  }
+  tls=/var/lib/postgresql/tls
+  ssl=off
+  if [ -s "$$tls/server.crt" ] && [ -s "$$tls/server.key" ]; then ssl=on; fi
+  {
+    echo 'local all all trust'
+    echo 'host all all 127.0.0.1/32 trust'
+    echo 'host all all ::1/128 trust'
+    echo 'local replication all trust'
+    echo 'host replication all 127.0.0.1/32 trust'
+    echo 'host replication all ::1/128 trust'
+    # Docker Desktop, rootless Docker and Podman hand Postgres every outside
+    # connection from the Docker network's end on the host, which "samenet"
+    # includes. With KEEL_DB_GATEWAY=remote those addresses count as remote.
+    if [ "$${KEEL_DB_GATEWAY:-local}" = remote ]; then
+      for gw in $$(host_ends); do
+        echo "hostnossl all all $$gw/32 reject"
+        echo "host all $$service_roles $$gw/32 reject"
+        if [ "$${KEEL_DB_REMOTE_SUPERUSER:-off}" != on ]; then echo "host all $${POSTGRES_USER:-postgres} $$gw/32 reject"; fi
+      done
+    fi
+    for net in $$(echo "$${KEEL_DB_LOCAL_NETWORKS:-samenet}" | tr ',' ' '); do
+      echo "host all all $$net scram-sha-256"
+    done
+    # Keel's own roles only ever connect from its containers.
+    echo "host all $$service_roles all reject"
+    if [ "$${KEEL_DB_REMOTE_SUPERUSER:-off}" != on ]; then
+      echo "host all $${POSTGRES_USER:-postgres} all reject"
+    fi
+    if [ "$$ssl" = on ]; then echo 'hostssl all all all scram-sha-256'; fi
+  } > "$$hba"
+  set -- "$$@" -c "hba_file=$$hba"
+  # Extra Postgres settings, e.g. KEEL_DB_SETTINGS="shared_buffers=64MB work_mem=2MB".
+  for setting in $${KEEL_DB_SETTINGS:-}; do set -- "$$@" -c "$$setting"; done
+  if [ "$$ssl" = on ]; then
+    set -- "$$@" -c ssl=on -c "ssl_cert_file=$$tls/server.crt" -c "ssl_key_file=$$tls/server.key"
+  else
+    echo "keel: no TLS certificate in $$tls, so only Keel's own containers can connect" >&2
+  fi
+  exec docker-entrypoint.sh "$$@"
+
+# Makes a self-signed TLS certificate for Postgres on first start (valid for
+# 10 years). Put your own server.crt and server.key in its folder to use those.
+x-db-tls: &db-tls |
+  set -eu
+  cd /tls
+  if [ ! -s server.crt ] || [ ! -s server.key ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      umask 077
+      openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 -subj /CN=keel-db \
+        -addext subjectAltName=DNS:keel-db,DNS:localhost,IP:127.0.0.1 \
+        -keyout server.key.new -out server.crt.new 2>/dev/null
+      mv -f server.key.new server.key
+      mv -f server.crt.new server.crt
+      echo "keel: created a TLS certificate for Postgres"
+    else
+      echo "keel: this image has no openssl, so Postgres runs without TLS" >&2
+    fi
+  fi
+  # Postgres (uid 70 in its Alpine image) wants a key it owns and nobody else can read.
+  if [ -s server.key ]; then
+    chown 70:70 server.key server.crt
+    chmod 600 server.key
+    chmod 644 server.crt
+  fi
+  touch /tmp/ready
+  # Stays up (healthy) so panels that expect running containers are happy.
+  exec sleep 2147483647
+
+x-db-tls-service: &db-tls-service
+  init: true
+  restart: unless-stopped
+  logging: *logging
+  entrypoint: ["/bin/sh", "-c", *db-tls]
+  # Root to hand the key to Postgres' user; no network, read-only filesystem.
+  user: "0:0"
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+  read_only: true
+  tmpfs: [/tmp]
+  network_mode: none
+  healthcheck:
+    test: ["CMD", "test", "-f", "/tmp/ready"]
+    interval: 3s
+    timeout: 3s
+    retries: 100
+  labels:
+    keel.role: Database TLS
+
+# Health checks: Docker, ZimaOS, Portainer and uptime monitors see a service
+# that stops answering, not only one that exits.
+x-health: &health
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+
+services:
+  keel-db-tls:
+    <<: *db-tls-service
+    image: ${KEEL_IMAGE:-keel:local}
+    pull_policy: never
+    volumes:
+      - keel-db-tls:/tls
+
+  # Postgres with pgvector and PostGIS (the Dockerfile's db target), from the
+  # same Postgres image as keel's pg_dump.
+  keel-db:
+    image: ${KEEL_DB_IMAGE:-keel-postgres:local}
+    build:
+      context: .
+      target: db
+    pull_policy: never
+    restart: unless-stopped
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-c", *db-start, "keel-db"]
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=32
+      - -c
+      - max_wal_senders=32
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - log_min_duration_statement=${KEEL_SLOW_QUERY_MS:-200}
+      # Slow statements are logged without their values (passwords, personal data).
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./keel init to create a .env file}
+      TZ: ${TZ:-UTC}
+      KEEL_DB_REMOTE_SUPERUSER: ${KEEL_DB_REMOTE_SUPERUSER:-off}
+      KEEL_DB_LOCAL_NETWORKS: ${KEEL_DB_LOCAL_NETWORKS:-samenet}
+      KEEL_DB_GATEWAY: ${KEEL_DB_GATEWAY:-local}
+      KEEL_DB_SETTINGS: ${KEEL_DB_SETTINGS:-}
+    volumes:
+      - keel-db:/var/lib/postgresql/data
+      - keel-db-tls:/var/lib/postgresql/tls:ro
+    depends_on:
+      keel-db-tls:
+        condition: service_healthy
+    ports:
+      - "${KEEL_DB_BIND:-127.0.0.1}:${KEEL_DB_PORT:-5432}:5432"
+    networks: [default, functions, egress]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    labels:
+      keel.role: Database
+
+  # One-shot: creates roles, upgrades project databases, creates the first project.
+  keel-migrate:
+    image: ${KEEL_IMAGE:-keel:local}
+    build: .
+    init: true
+    command: ["migrate"]
+    restart: "no"
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    environment:
+      <<: *keel-env
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./keel init to create a .env file}
+      KEEL_SERVICE_PASSWORD: *service-password
+      KEEL_DEFAULT_PROJECT: ${KEEL_DEFAULT_PROJECT:-my-app}
+    # Each service role's password, written here for the one service that uses it.
+    volumes:
+      - keel-cred-authenticator:/var/lib/keel/credentials/authenticator
+      - keel-cred-auth:/var/lib/keel/credentials/keel_auth_admin
+      - keel-cred-storage:/var/lib/keel/credentials/keel_storage_admin
+      - keel-cred-realtime:/var/lib/keel/credentials/keel_realtime_admin
+      - keel-cred-functions:/var/lib/keel/credentials/keel_functions_admin
+      - keel-cred-egress:/var/lib/keel/credentials/keel_egress_admin
+      # For ./keel restore, which runs in this container.
+      - keel-storage:/var/lib/keel/storage
+      - keel-backups:/var/lib/keel/backups
+    depends_on:
+      keel-db:
+        condition: service_healthy
+    labels:
+      keel.role: Migrations
+
+  keel-rest:
+    <<: *keel
+    command: ["rest"]
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - keel-cred-authenticator:/var/lib/keel/credentials/authenticator:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      <<: *health
+    labels:
+      keel.role: REST API
+      keel.image: postgrest/postgrest:v12.2.12
+
+  keel-auth:
+    <<: *keel
+    command: ["auth"]
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - keel-cred-auth:/var/lib/keel/credentials/keel_auth_admin:ro
+    environment:
+      <<: *keel-env
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9999/health"]
+      <<: *health
+    labels:
+      keel.role: Auth
+
+  keel-realtime:
+    <<: *keel
+    command: ["realtime"]
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - keel-cred-realtime:/var/lib/keel/credentials/keel_realtime_admin:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4000/health"]
+      <<: *health
+    labels:
+      keel.role: Realtime
+
+  keel-storage:
+    <<: *keel
+    command: ["storage"]
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      <<: *keel-env
+      KEEL_STORAGE_MAX_FILE_SIZE: ${KEEL_STORAGE_MAX_FILE_SIZE:-52428800}
+      IMGPROXY_KEY: ${IMGPROXY_KEY:-}
+      IMGPROXY_SALT: ${IMGPROXY_SALT:-}
+    volumes:
+      - keel-storage:/var/lib/keel/storage
+      - keel-cred-storage:/var/lib/keel/credentials/keel_storage_admin:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/health"]
+      <<: *health
+    labels:
+      keel.role: Storage
+
+  # Edge functions (Deno). Each function runs in its own process, started on
+  # first use and stopped when idle. On a network of its own with only the
+  # gateway, the database and Studio, so function code can't reach the rest.
+  keel-functions:
+    <<: *keel
+    image: ${KEEL_FUNCTIONS_IMAGE:-keel-functions:local}
+    build:
+      context: .
+      target: functions
+    command: ["functions"]
+    environment:
+      <<: *keel-env
+      # Studio's token for the internal endpoints (logs). Not KEEL_SECRET.
+      KEEL_FUNCTIONS_TOKEN: ${KEEL_FUNCTIONS_TOKEN:-}
+      KEEL_FUNCTIONS_MEMORY_MB: ${KEEL_FUNCTIONS_MEMORY_MB:-256}
+      KEEL_FUNCTIONS_TIMEOUT: ${KEEL_FUNCTIONS_TIMEOUT:-150}
+      KEEL_FUNCTIONS_IDLE: ${KEEL_FUNCTIONS_IDLE:-300}
+      KEEL_FUNCTIONS_MAX_WORKERS: ${KEEL_FUNCTIONS_MAX_WORKERS:-20}
+      KEEL_FUNCTIONS_BOOT_TIMEOUT: ${KEEL_FUNCTIONS_BOOT_TIMEOUT:-90}
+      KEEL_FUNCTIONS_ALLOW_LAN: ${KEEL_FUNCTIONS_ALLOW_LAN:-}
+      # More addresses they may not reach, e.g. this server's public IP when KEEL_PUBLIC_URL is a domain name.
+      KEEL_FUNCTIONS_DENY_NET: ${KEEL_FUNCTIONS_DENY_NET:-}
+      # This server's own LAN addresses (written by the installer): closed to functions even inside an allowed range.
+      KEEL_HOST_ADDRESSES: ${KEEL_HOST_ADDRESSES:-}
+    volumes:
+      - keel-functions:/var/lib/keel/functions
+      - keel-cred-functions:/var/lib/keel/credentials/keel_functions_admin:ro
+    networks: [functions]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9000/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      <<: *health
+    labels:
+      keel.role: Edge functions
+
+  # Sends the HTTP requests projects queue from SQL (net.http_post, database
+  # webhooks). It logs in with a role that can only take requests off those
+  # queues and write the responses, holds no superuser password and can't
+  # reach the Docker socket proxy: on a network of its own with the database
+  # and the gateway (for calls to a project's own functions), and the internet.
+  keel-egress:
+    <<: *keel
+    command: ["egress"]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 256m
+    environment:
+      <<: *keel-env
+      # Requests follow the edge functions' rules: LAN addresses opened for functions, addresses kept out.
+      KEEL_FUNCTIONS_ALLOW_LAN: ${KEEL_FUNCTIONS_ALLOW_LAN:-}
+      KEEL_FUNCTIONS_DENY_NET: ${KEEL_FUNCTIONS_DENY_NET:-}
+      KEEL_HOST_ADDRESSES: ${KEEL_HOST_ADDRESSES:-}
+      # Limits (empty = the defaults in the docs).
+      KEEL_NET_CONCURRENCY: ${KEEL_NET_CONCURRENCY:-}
+      KEEL_NET_MAX_TIMEOUT_MS: ${KEEL_NET_MAX_TIMEOUT_MS:-}
+      KEEL_NET_MAX_RESPONSE_BYTES: ${KEEL_NET_MAX_RESPONSE_BYTES:-}
+      KEEL_NET_TTL_HOURS: ${KEEL_NET_TTL_HOURS:-}
+    volumes:
+      - keel-cred-egress:/var/lib/keel/credentials/keel_egress_admin:ro
+    networks: [egress]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/health"]
+      <<: *health
+    labels:
+      keel.role: Outgoing requests
+
+  keel-imgproxy:
+    image: darthsim/imgproxy:v3@sha256:73c5dda13199745b0d2d00e4149d4a589c5b2e205dbf335ca05eca8276b54712
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    environment:
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /storage
+      # Only files from storage, never URLs from elsewhere.
+      IMGPROXY_ALLOWED_SOURCES: "local://"
+      IMGPROXY_KEY: ${IMGPROXY_KEY:-}
+      IMGPROXY_SALT: ${IMGPROXY_SALT:-}
+      IMGPROXY_USE_ETAG: "true"
+      IMGPROXY_MAX_SRC_RESOLUTION: "50"
+    volumes:
+      - keel-storage:/storage:ro
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      <<: *health
+    labels:
+      keel.role: Image resize
+
+  keel-gateway:
+    <<: *keel
+    command: ["gateway"]
+    # Writes only to its volumes; everything else is read-only.
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - keel-cred-authenticator:/var/lib/keel/credentials/authenticator:ro
+    environment:
+      <<: *keel-env
+      # off: the API doesn't serve the documentation at /docs (Studio still does).
+      KEEL_GATEWAY_DOCS: ${KEEL_GATEWAY_DOCS:-on}
+      # Where the port is published: on 127.0.0.1, a proxy on this machine is trusted.
+      KEEL_PUBLISHED_ON: ${KEEL_GATEWAY_BIND:-0.0.0.0}
+    ports:
+      - "${KEEL_GATEWAY_BIND:-0.0.0.0}:${KEEL_GATEWAY_PORT:-8000}:8000"
+    networks: [default, functions, egress, public]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
+      <<: *health
+    labels:
+      keel.role: Gateway
+
+  keel-studio:
+    <<: *keel
+    command: ["studio"]
+    environment:
+      <<: *keel-env
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./keel init to create a .env file}
+      KEEL_SERVICE_PASSWORD: *service-password
+      KEEL_SECRET: ${KEEL_SECRET:?Run ./keel init to create a .env file}
+      KEEL_FUNCTIONS_TOKEN: ${KEEL_FUNCTIONS_TOKEN:-}
+      KEEL_DASHBOARD_USERNAME: ${KEEL_DASHBOARD_USERNAME:-admin}
+      KEEL_DASHBOARD_PASSWORD: ${KEEL_DASHBOARD_PASSWORD:?Run ./keel init to create a .env file}
+      KEEL_HOST_LABEL: ${KEEL_HOST_LABEL:-}
+      # Where the port is published: on 127.0.0.1, a proxy on this machine is trusted.
+      KEEL_PUBLISHED_ON: ${KEEL_STUDIO_BIND:-127.0.0.1}
+      # Extra host names Studio answers to (it always does to IP addresses and local names).
+      KEEL_STUDIO_HOSTS: ${KEEL_STUDIO_HOSTS:-}
+      # Host shown in Postgres connection strings (default: the host of KEEL_PUBLIC_URL).
+      KEEL_PUBLIC_DB_HOST: ${KEEL_PUBLIC_DB_HOST:-}
+      KEEL_BACKUP_SCHEDULE: ${KEEL_BACKUP_SCHEDULE:-03:00}
+      KEEL_BACKUP_RETENTION: ${KEEL_BACKUP_RETENTION:-7}
+      # Full backups (every database and the uploaded files), encrypted with
+      # this passphrase. Empty: off. Keep a copy of it somewhere else.
+      KEEL_BACKUP_PASSPHRASE: ${KEEL_BACKUP_PASSPHRASE:-}
+      KEEL_BACKUP_KEEP_LOCAL: ${KEEL_BACKUP_KEEP_LOCAL:-2}
+      # Off-machine copies in an S3-compatible bucket (or set it up in Studio).
+      KEEL_BACKUP_S3_ENDPOINT: ${KEEL_BACKUP_S3_ENDPOINT:-}
+      KEEL_BACKUP_S3_REGION: ${KEEL_BACKUP_S3_REGION:-}
+      KEEL_BACKUP_S3_BUCKET: ${KEEL_BACKUP_S3_BUCKET:-}
+      KEEL_BACKUP_S3_PREFIX: ${KEEL_BACKUP_S3_PREFIX:-}
+      KEEL_BACKUP_S3_ACCESS_KEY_ID: ${KEEL_BACKUP_S3_ACCESS_KEY_ID:-}
+      KEEL_BACKUP_S3_SECRET_ACCESS_KEY: ${KEEL_BACKUP_S3_SECRET_ACCESS_KEY:-}
+      KEEL_BACKUP_S3_PATH_STYLE: ${KEEL_BACKUP_S3_PATH_STYLE:-on}
+      # Studio checks GitHub once a day for a newer release; "off" turns it off.
+      KEEL_UPDATE_CHECK: ${KEEL_UPDATE_CHECK:-on}
+      # Scheduled jobs (empty = the defaults in the docs).
+      KEEL_CRON_TIMEOUT: ${KEEL_CRON_TIMEOUT:-}
+      KEEL_CRON_HISTORY_DAYS: ${KEEL_CRON_HISTORY_DAYS:-}
+      KEEL_CRON_MAX_RUNNING: ${KEEL_CRON_MAX_RUNNING:-}
+      # Studio sends invites and reset links itself and shows whether email works.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      # No ":" so that KEEL_DOCKER_HOST= (empty) turns container controls off.
+      DOCKER_HOST: ${KEEL_DOCKER_HOST-tcp://keel-docker:2375}
+      KEEL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-keel}
+    volumes:
+      - keel-backups:/var/lib/keel/backups
+      - keel-tunnel:/var/lib/keel/tunnel
+      # Read-only: full backups copy the uploaded files.
+      - keel-storage:/var/lib/keel/storage:ro
+    ports:
+      - "${KEEL_STUDIO_BIND:-127.0.0.1}:${KEEL_STUDIO_PORT:-3000}:3000"
+    networks: [default, functions, docker-api, public]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      <<: *health
+    labels:
+      keel.role: Studio
+
+  # Cloudflare Tunnel, run once you paste a tunnel token in Studio (Connect >
+  # Internet access); idle until then. It only joins keel-public, so the
+  # tunnel can reach the gateway and Studio and nothing else.
+  keel-tunnel:
+    <<: *keel
+    command: ["tunnel"]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      KEEL_LOG_LEVEL: ${KEEL_LOG_LEVEL:-info}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - keel-tunnel:/var/lib/keel/tunnel
+    networks: [public]
+    labels:
+      keel.role: Tunnel
+
+  # Lets Studio list Keel's containers, read their logs and start, stop or
+  # restart them. Every other Docker call is refused, and other containers on
+  # this machine (and all environment variables) stay hidden.
+  # Remove this service (and set KEEL_DOCKER_HOST=) to turn that off.
+  keel-docker:
+    image: ${KEEL_IMAGE:-keel:local}
+    pull_policy: never
+    command: ["docker-proxy"]
+    init: true
+    restart: unless-stopped
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    # Root only to open Docker's socket.
+    user: "0:0"
+    depends_on:
+      keel-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Only Studio can reach it.
+    networks: [docker-api]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2375/_ping"]
+      <<: *health
+    labels:
+      keel.role: Docker access
+
+networks:
+  default:
+  functions:
+  # The database, the gateway and keel-egress: outgoing requests from SQL.
+  egress:
+  docker-api:
+    internal: true
+  # Only the gateway, Studio and keel-tunnel join this network, so a tunnel can
+  # reach the API and Studio and nothing else. A second Keel on the same
+  # machine needs a name of its own (KEEL_PUBLIC_NETWORK), or the two would
+  # share this network.
+  public:
+    name: ${KEEL_PUBLIC_NETWORK:-keel-public}
+
+volumes:
+  keel-db:
+  keel-db-tls:
+  keel-storage:
+  keel-backups:
+  keel-functions:
+  keel-tunnel:
+  # One per service role (see keel-migrate).
+  keel-cred-authenticator:
+  keel-cred-auth:
+  keel-cred-storage:
+  keel-cred-realtime:
+  keel-cred-functions:
+  keel-cred-egress:

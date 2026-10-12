@@ -1,0 +1,860 @@
+#!/usr/bin/env bash
+# Keel helper. Thin wrapper around docker compose. Works in a copy of the
+# source (builds the images) and in a folder set up by the Keel installer
+# (uses the published images).
+set -euo pipefail
+
+ORIG_PWD=$PWD
+cd "$(dirname "$0")"
+
+die() { echo "keel: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+
+rand_hex() { openssl rand -hex "$1"; }
+rand_pw() { openssl rand -base64 24 | tr -d '/+=' | cut -c1-20; }
+
+# Git Bash / MSYS2 on Windows (Docker Desktop's CLI there is a Windows program).
+is_msys() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+is_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }
+
+# An IPv4 address or a plain host name, nothing else (the value goes into .env).
+looks_like_host() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
+  [ "${#1}" -le 253 ] && [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+# The Windows host's LAN address (Docker Desktop publishes ports there), from
+# Git Bash or WSL: the IPv4 address of the adapter with a default gateway.
+windows_lan_ip() {
+  command -v powershell.exe >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC2016
+  powershell.exe -NoProfile -NonInteractive -Command \
+    '(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq "Up" } | Select-Object -First 1).IPv4Address.IPAddress' \
+    2>/dev/null | tr -d '\r' | head -n 1 || true
+}
+
+# This machine's address on the local network, or "localhost".
+detect_host() {
+  local ip="" iface
+  case "$(uname -s)" in
+    Darwin)
+      for iface in en0 en1; do
+        ip=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
+        [ -n "$ip" ] && break
+      done
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      ip=$(windows_lan_ip)
+      ;;
+    *)
+      if is_wsl; then ip=$(windows_lan_ip); fi
+      if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+        ip=$( (ip route get 1.1.1.1 2>/dev/null || true) | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+      fi
+      if [ -z "$ip" ] && hostname -I >/dev/null 2>&1; then
+        ip=$(hostname -I | awk '{print $1}')
+      fi
+      ;;
+  esac
+  looks_like_host "$ip" || ip=""
+  echo "${ip:-localhost}"
+}
+
+# Docker Desktop (macOS, Windows), rootless Docker and Podman hand containers
+# every outside connection from the Docker network's gateway, so Postgres can't
+# tell this machine from the rest of the network.
+docker_hides_clients() {
+  case "$(uname -s)" in Darwin|MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  is_wsl && return 0
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info -f '{{.SecurityOptions}} {{.OperatingSystem}}' 2>/dev/null | grep -qi 'rootless\|docker desktop' && return 0
+  docker --version 2>/dev/null | grep -qi podman && return 0
+  return 1
+}
+
+# A cloud VM usually has a private address behind 1:1 NAT, so the address
+# alone says nothing. Ask the firmware and the metadata service instead
+# (the same check as the installer's). Prints the provider, if any.
+detect_cloud() {
+  [ "$(uname -s)" = Linux ] && ! is_wsl || return 0
+  local f v code
+  for f in sys_vendor product_name bios_vendor board_vendor chassis_vendor chassis_asset_tag; do
+    v=$(cat "/sys/class/dmi/id/$f" 2>/dev/null || true)
+    case "$v" in
+      *Amazon*|*EC2*|*Google*|*DigitalOcean*|*Hetzner*|*Linode*|*Akamai*|*Vultr*|*Scaleway*|*OVH*|*OpenStack*|*Alibaba*|*Tencent*|*UpCloud*|*Exoscale*|*OracleCloud*|*Oracle\ Cloud*|*IONOS*|*Contabo*|*netcup*|7783-7084-3265-9085-8269-3286-77)
+        echo "$v"; return 0 ;;
+    esac
+  done
+  command -v curl >/dev/null 2>&1 || return 0
+  code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 -m 2 http://169.254.169.254/ 2>/dev/null || true)
+  if [ -n "$code" ] && [ "$code" != 000 ]; then echo "metadata service"; fi
+}
+
+# Every IPv4 address of this machine on the network (comma separated), so
+# function code can't reach it even inside an allowed LAN range.
+host_addresses() {
+  {
+    detect_host
+    if [ "$(uname -s)" = Linux ]; then hostname -I 2>/dev/null | tr ' ' '\n' || true; fi
+  } | grep -E '^([0-9]{1,3}[.]){3}[0-9]{1,3}$' | grep -v '^127[.]' | sort -u | paste -sd, - || true
+}
+
+# Escapes a value for the replacement side of sed's s|...|...|.
+sed_value() { printf '%s' "$1" | sed -e 's/[\|&]/\\&/g'; }
+
+compose() { docker compose "$@"; }
+
+# Studio's address: localhost when it listens on this machine only (third
+# argument, the bind address), otherwise KEEL_PUBLIC_URL's host.
+studio_url() {
+  local host="${1#*://}"
+  host="${host%%/*}"
+  host="${host%:*}"
+  case "${3:-}" in 127.*|localhost) host=localhost ;; esac
+  echo "http://${host:-localhost}:${2:-3000}"
+}
+
+cmd_init() {
+  local url="" force=0 project="" studio_bind=127.0.0.1 db_bind=127.0.0.1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --url) url="${2:-}"; shift 2 ;;
+      --project) project="${2:-}"; shift 2 ;;
+      --lan) studio_bind=0.0.0.0; shift ;;
+      --lan-db) db_bind=0.0.0.0; shift ;;
+      --force) force=1; shift ;;
+      *) die "unknown option $1 (use --url, --project, --lan, --lan-db, --force)" ;;
+    esac
+  done
+  need openssl
+  [ -f .env.example ] || die "no .env.example here; ./keel init is for a copy of the Keel source"
+  if [ -f .env ] && [ "$force" -ne 1 ]; then
+    die ".env already exists. Use --force to overwrite it (this breaks an existing database)."
+  fi
+  [ -n "$url" ] || url="http://$(detect_host):8000"
+  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || die "--url must look like http://192.168.1.20:8000 or https://api.example.com"
+  if [ -n "$project" ] && ! [[ "$project" =~ ^[a-z][a-z0-9-]*$ ]]; then
+    die "--project: lowercase letters, digits and dashes, starting with a letter"
+  fi
+  local pw label tmp db_gateway=local exposure="" cloud
+  cloud=$(detect_cloud)
+  [ -z "$cloud" ] || exposure=internet
+  if [ "$db_bind" = 0.0.0.0 ] && docker_hides_clients; then db_gateway=remote; fi
+  pw=$(rand_pw)
+  label=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+  looks_like_host "$label" || label=""
+  # Written to a temporary file (owner-only) and moved into place at the end,
+  # so a failure never leaves an empty or half-written .env behind.
+  tmp=$(umask 077 && mktemp .env.XXXXXX)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" EXIT
+  sed \
+    -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(rand_hex 24)|" \
+    -e "s|^KEEL_SERVICE_PASSWORD=.*|KEEL_SERVICE_PASSWORD=$(rand_hex 24)|" \
+    -e "s|^KEEL_SECRET=.*|KEEL_SECRET=$(rand_hex 32)|"     -e "s|^KEEL_FUNCTIONS_TOKEN=.*|KEEL_FUNCTIONS_TOKEN=$(rand_hex 32)|" \
+    -e "s|^KEEL_DASHBOARD_PASSWORD=.*|KEEL_DASHBOARD_PASSWORD=${pw}|" \
+    -e "s|^KEEL_PUBLIC_URL=.*|KEEL_PUBLIC_URL=$(sed_value "$url")|" \
+    -e "s|^KEEL_HOST_LABEL=.*|KEEL_HOST_LABEL=${label}|" \
+    -e "s|^IMGPROXY_KEY=.*|IMGPROXY_KEY=$(rand_hex 32)|" \
+    -e "s|^IMGPROXY_SALT=.*|IMGPROXY_SALT=$(rand_hex 32)|" \
+    -e "s|^KEEL_STUDIO_BIND=.*|KEEL_STUDIO_BIND=${studio_bind}|" \
+    -e "s|^KEEL_DB_BIND=.*|KEEL_DB_BIND=${db_bind}|" \
+    -e "s|^KEEL_DB_GATEWAY=.*|KEEL_DB_GATEWAY=${db_gateway}|" \
+    -e "s|^KEEL_EXPOSURE=.*|KEEL_EXPOSURE=${exposure}|" \
+    -e "s|^KEEL_HOST_ADDRESSES=.*|KEEL_HOST_ADDRESSES=$(sed_value "$(host_addresses)")|" \
+    -e "s|^KEEL_DEFAULT_PROJECT=.*|KEEL_DEFAULT_PROJECT=${project:-my-app}|" \
+    .env.example > "$tmp"
+  grep -q '^POSTGRES_PASSWORD=.' "$tmp" || die "could not write .env"
+  chmod 600 "$tmp"
+  mv -f "$tmp" .env
+  trap - EXIT
+  echo "Wrote .env"
+  echo
+  echo "  API gateway:  ${url}"
+  echo "  Studio:       $(studio_url "$url" 3000 "$studio_bind")"
+  echo "  Studio login: admin / ${pw}"
+  if [ "$studio_bind" != 0.0.0.0 ]; then
+    echo
+    echo "  Studio and Postgres listen on this machine only. To open Studio to your"
+    echo "  network, set KEEL_STUDIO_BIND=0.0.0.0 in .env (or use ./keel init --lan)."
+  fi
+  if [ -n "$cloud" ]; then
+    echo
+    echo "  This looks like a cloud server ($cloud), so KEEL_EXPOSURE=internet: new"
+    echo "  projects start with sign-ups off, or confirmed by email with a mail server."
+  fi
+  if [ "$db_gateway" = remote ]; then
+    echo
+    echo "  Docker here hides where connections come from, so Postgres treats every"
+    echo "  connection to its port as coming from your network, this machine's too:"
+    echo "  TLS is required and postgres can't sign in (KEEL_DB_GATEWAY in .env)."
+  fi
+  echo
+  echo "Next: ./keel up"
+}
+
+cmd_up() {
+  need docker
+  [ -f .env ] || die "no .env yet. Run ./keel init first."
+  # Published images unless this is a copy of the source without KEEL_IMAGE set.
+  if [ -f Dockerfile ] && ! grep -q '^KEEL_IMAGE=.' .env; then
+    compose build keel-migrate
+  else
+    pull_or_local keel-migrate
+  fi
+  if [ -f Dockerfile ] && ! grep -q '^KEEL_FUNCTIONS_IMAGE=.' .env; then
+    compose build keel-functions
+  else
+    pull_or_local keel-functions
+  fi
+  if [ -f Dockerfile ] && ! grep -q '^KEEL_DB_IMAGE=.' .env; then
+    compose build keel-db
+  else
+    pull_or_local keel-db
+  fi
+  compose up -d "$@"
+  local url port bind
+  url=$(env_get KEEL_PUBLIC_URL)
+  port=$(env_get KEEL_STUDIO_PORT)
+  bind=$(env_get KEEL_STUDIO_BIND)
+  echo
+  echo "Keel is starting. Studio: $(studio_url "$url" "$port" "${bind:-127.0.0.1}")"
+}
+
+env_get() {
+  { grep -E "^$1=" .env 2>/dev/null || true; } | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//'
+}
+
+# Sets a setting in .env, replacing an existing line (no sed -i: BSD and GNU differ).
+env_set() {
+  local tmp
+  tmp=$(umask 077 && mktemp .env.XXXXXX)
+  { grep -vE "^$1=" .env || true; printf '%s=%s
+' "$1" "$2"; } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" .env
+}
+
+# Pulls a service's image; when that fails (offline, Docker Hub limits, or a
+# local-only tag such as "previous"), a copy already on this machine is used.
+pull_or_local() {
+  compose pull -q "$1" && return 0
+  echo "keel: couldn't download the image for $1; using the copy on this machine, if there is one" >&2
+}
+
+cmd_psql() {
+  local project=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project|-p) project="$2"; shift 2 ;;
+      --project=*) project="${1#--project=}"; shift ;;
+      *) project="$1"; shift ;;
+    esac
+  done
+  [ -n "$project" ] || project=$(env_get KEEL_DEFAULT_PROJECT)
+  local db="${project:-postgres}"
+  db="${db//-/_}"
+  # -T when input is piped in (./keel psql my-app < schema.sql), so it isn't rejected as "not a TTY".
+  local tty=() pre=()
+  [ -t 0 ] || tty=(-T)
+  # Git Bash's mintty window isn't a console docker.exe can use as a TTY: go
+  # through winpty when it's installed, otherwise run without a TTY.
+  if is_msys && [ -t 0 ] && [ "${TERM_PROGRAM:-}" = mintty ]; then
+    if command -v winpty >/dev/null 2>&1; then pre=(winpty); else tty=(-T); fi
+  fi
+  ${pre[@]+"${pre[@]}"} docker compose exec ${tty[@]+"${tty[@]}"} keel-db psql -U postgres -d "$db"
+}
+
+# A folder as docker should see it in -v. Under Git Bash that's the Windows
+# path (C:/Users/...): docker.exe doesn't understand MSYS paths like /c/Users.
+host_dir() {
+  if is_msys; then (cd "$1" && pwd -W); else (cd "$1" && pwd); fi
+}
+
+# Resolves a path given on the command line (relative to where ./keel was run).
+abs_path() {
+  case "$1" in
+    /*) echo "$1" ;;
+    *) echo "$ORIG_PWD/$1" ;;
+  esac
+}
+
+# Runs a one-off command in the Keel image (uses the running database).
+keel_run() {
+  [ -f .env ] || die "no .env yet. Run ./keel init first."
+  # Stops Git Bash from turning container paths (/src/functions) into Windows paths.
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' compose run --rm --no-deps -T "$@"
+}
+
+cmd_functions() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  local dir="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) dir="$2"; shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  case "$sub" in
+    deploy)
+      if [ -z "$dir" ]; then
+        for d in supabase/functions functions; do
+          if [ -d "$ORIG_PWD/$d" ]; then dir="$ORIG_PWD/$d"; break; fi
+        done
+      else
+        dir=$(abs_path "$dir")
+      fi
+      if [ -z "$dir" ] || [ ! -d "$dir" ]; then die "no functions folder found. Run this next to supabase/functions, or pass --dir PATH"; fi
+      local mounts=(-v "$(host_dir "$dir"):/src/functions:ro")
+      [ -f "$dir/../config.toml" ] && mounts+=(-v "$(host_dir "$dir/..")/config.toml:/src/config.toml:ro")
+      keel_run "${mounts[@]}" keel-migrate fn deploy ${args[@]+"${args[@]}"}
+      ;;
+    list|delete)
+      keel_run keel-migrate fn "$sub" ${args[@]+"${args[@]}"}
+      ;;
+    *) die "usage: ./keel functions <deploy|list|delete> [name ...] [--project NAME] [--dir PATH] [--no-verify-jwt]" ;;
+  esac
+}
+
+cmd_secrets() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --env-file)
+        local f
+        f=$(abs_path "$2")
+        [ -f "$f" ] || die "no such file: $2"
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="${line%$'\r'}"
+          case "$line" in ''|'#'*) continue ;; esac
+          line="${line#export }"
+          local k="${line%%=*}" v="${line#*=}"
+          v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+          args+=("$k=$v")
+        done < "$f"
+        shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  case "$sub" in
+    list|set|unset) keel_run keel-migrate secrets "$sub" ${args[@]+"${args[@]}"} ;;
+    *) die "usage: ./keel secrets <list|set NAME=value ...|unset NAME ...> [--env-file FILE] [--project NAME]" ;;
+  esac
+}
+
+cmd_import_supabase() {
+  [ $# -gt 0 ] || die "usage: ./keel import-supabase --db-url 'postgresql://…' [--url https://<ref>.supabase.co --service-key KEY] [--project NAME]"
+  keel_run keel-migrate import-supabase "$@"
+}
+
+# --- Versions, backups, update and rollback -----------------------------------
+#
+# An update moves between version tags (KEEL_VERSION in .env) and remembers the
+# one it came from (KEEL_PREVIOUS_VERSION). Before it changes anything it dumps
+# every database (each project and Keel's own) from the running keel-db into
+# backups/pre-update/<time>/, so ./keel rollback --restore can undo schema
+# upgrades. keel-migrate refuses to start an image older than the database.
+
+PRE_UPDATE_DIR=backups/pre-update
+KEEP_PRE_UPDATE=3
+
+# A copy of the source (builds its images) rather than an installed folder.
+is_source() { [ -f Dockerfile ]; }
+is_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; }
+# True when version $1 is lower than $2.
+version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
+
+# Questions go to the terminal; without one, the default answer is taken.
+assume_yes=""
+ask() { # ask "question" default(y|n) -> 0 for yes
+  local answer=""
+  if [ -n "$assume_yes" ]; then return 0; fi
+  if ! { : </dev/tty; } 2>/dev/null; then [ "$2" = y ]; return; fi
+  printf '%s [%s] ' "$1" "$([ "$2" = y ] && echo Y/n || echo y/N)" >/dev/tty
+  read -r answer </dev/tty || answer=""
+  case "${answer:-$2}" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+pg_user() { local u; u=$(env_get POSTGRES_USER); echo "${u:-postgres}"; }
+db_exec() { compose exec -T keel-db "$@"; }
+db_query() { db_exec psql -U "$(pg_user)" -X -At -v ON_ERROR_STOP=1 -d "$1" -c "$2"; }
+
+# Starts keel-db if needed and waits until it answers.
+ensure_db() {
+  if [ -z "$(compose ps -q --status running keel-db 2>/dev/null)" ]; then
+    compose up -d --no-deps keel-db >/dev/null
+  fi
+  local _
+  for _ in $(seq 1 60); do
+    db_exec pg_isready -q -U "$(pg_user)" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  die "the database (keel-db) didn't start; see ./keel logs keel-db"
+}
+
+# Every database except the templates and postgres: the projects and Keel's own.
+list_dbs() { db_query postgres "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1"; }
+
+# One line per database with its highest schema upgrade, plus what keel-migrate
+# recorded. When this differs from the pre-update backup, upgrades ran.
+schema_levels() {
+  local db
+  for db in $(list_dbs); do
+    if [ "$(db_query "$db" "select to_regclass('_keel.migrations') is not null")" = t ]; then
+      echo "$db=$(db_query "$db" 'select coalesce(max(version), 0) from _keel.migrations')"
+    elif [ "$(db_query "$db" "select to_regclass('keel.schema_state') is not null")" = t ]; then
+      echo "$db=control:$(db_query "$db" "select project_migration || '/' || control_schema from keel.schema_state")"
+    else
+      echo "$db=-"
+    fi
+  done
+}
+
+# The repository of the keel image in the compose file, e.g. ghcr.io/me/keel.
+keel_repo() { compose config --images 2>/dev/null | sed -n 's#^\(.*/keel\):.*#\1#p' | head -n 1; }
+
+# The published images a compose file uses: keel and keel-functions, and
+# keel-postgres for keel-db (older compose files ran the postgres image itself).
+keel_images() { # keel_images REPO [COMPOSE_FILE]
+  echo "$1" "$1-functions"
+  if grep -q '/keel-postgres:' "${2:-docker-compose.yml}" 2>/dev/null; then echo "$1-postgres"; fi
+}
+
+image_version() {
+  docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$1" 2>/dev/null || true
+}
+
+# The version running now: KEEL_VERSION when it's a version, else the version
+# label of the image in use (installs that follow "latest").
+current_version() {
+  local v id img
+  v=$(env_get KEEL_VERSION)
+  if is_version "$v"; then echo "$v"; return; fi
+  id=$(compose ps -a -q keel-migrate 2>/dev/null | head -n 1)
+  if [ -n "$id" ]; then img=$(docker inspect -f '{{.Image}}' "$id" 2>/dev/null || true); fi
+  [ -n "${img:-}" ] || img="$(keel_repo):${v:-latest}"
+  v=$(image_version "$img")
+  if is_version "$v"; then echo "$v"; fi
+}
+
+# The newest release: the version label of the image tagged latest.
+latest_release() {
+  local repo v
+  repo=$(keel_repo)
+  [ -n "$repo" ] || die "can't find the keel image in docker-compose.yml"
+  docker pull -q "$repo:latest" >/dev/null || die "could not download $repo:latest"
+  v=$(image_version "$repo:latest")
+  is_version "$v" || die "couldn't tell which version $repo:latest is; pass --version (e.g. --version 0.2.0)"
+  echo "$v"
+}
+
+# Tags the images in use as "previous", for a rollback when their version
+# isn't known (installs from before versioned releases).
+snapshot_images() {
+  local repo tag name
+  repo=$(keel_repo)
+  tag=$(env_get KEEL_VERSION)
+  for name in $(keel_images "$repo"); do
+    docker tag "$name:${tag:-latest}" "$name:previous" 2>/dev/null \
+      || die "couldn't keep a copy of $name:${tag:-latest} for a rollback"
+  done
+}
+
+# Dumps every database into a new folder under backups/pre-update.
+backup_databases() { # backup_databases FROM TO
+  local stamp dir db need free total
+  ensure_db
+  stamp=$(date +%Y%m%d-%H%M%S)
+  dir="$PRE_UPDATE_DIR/$stamp"
+  mkdir -p "$PRE_UPDATE_DIR"
+  [ -w "$PRE_UPDATE_DIR" ] || die "can't write to $PRE_UPDATE_DIR (run with sudo?)"
+  # Enough room for the dumps (they are compressed; the databases' size is a safe bound).
+  total=$(db_query postgres "select coalesce(sum(pg_database_size(datname)), 0) / 1024 from pg_database where not datistemplate")
+  free=$(df -Pk "$PRE_UPDATE_DIR" | awk 'NR == 2 { print $4 }')
+  if [ -n "$free" ] && [ -n "$total" ] && [ "$free" -lt "$total" ]; then
+    die "not enough free disk space for a backup before the update (need about $((total / 1024)) MB); free some space, or run with --no-backup"
+  fi
+  (umask 077 && mkdir -p "$dir")
+  echo "Backing up every database to $dir ..."
+  for db in $(list_dbs); do
+    (umask 077 && db_exec pg_dump -U "$(pg_user)" -Fc "$db" > "$dir/$db.dump") || { rm -rf "$dir"; die "backup of $db failed; nothing was changed"; }
+    need=$(wc -c < "$dir/$db.dump")
+    [ "$need" -gt 0 ] || { rm -rf "$dir"; die "backup of $db is empty; nothing was changed"; }
+  done
+  # Roles and their password hashes, for recovery by hand (not restored automatically).
+  (umask 077 && db_exec pg_dumpall -U "$(pg_user)" --globals-only > "$dir/globals.sql") || true
+  schema_levels > "$dir/schema"
+  [ ! -f docker-compose.yml ] || cp -p docker-compose.yml "$dir/docker-compose.yml"
+  printf 'from=%s\nto=%s\ntime=%s\n' "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dir/about"
+  # Keep the newest few.
+  # shellcheck disable=SC2012
+  ls -1d "$PRE_UPDATE_DIR"/*/ 2>/dev/null | sort -r | tail -n +$((KEEP_PRE_UPDATE + 1)) | while IFS= read -r old; do rm -rf "$old"; done || true
+  echo "Backup done: $dir"
+}
+
+newest_backup_set() {
+  # shellcheck disable=SC2012
+  ls -1d "$PRE_UPDATE_DIR"/*/ 2>/dev/null | sort -r | head -n 1 | sed 's#/$##' || true
+}
+
+# Replaces every database in the backup set with its dump. Keel's services are
+# stopped first; keel-db keeps running.
+restore_databases() {
+  local dir=$1 f db
+  compose stop >/dev/null
+  ensure_db
+  for f in "$dir"/*.dump; do
+    [ -f "$f" ] || continue
+    db=$(basename "$f" .dump)
+    echo "Restoring $db ..."
+    db_exec dropdb -U "$(pg_user)" --if-exists --force "$db"
+    db_exec pg_restore -U "$(pg_user)" -d postgres --create --exit-on-error < "$f" \
+      || die "restoring $db failed. The dumps are in $dir; see the backups guide to restore them by hand."
+  done
+}
+
+# Waits until Studio answers (or Docker reports Studio and the gateway healthy).
+wait_healthy() {
+  local port _ id s g
+  port=$(env_get KEEL_STUDIO_PORT)
+  port=${port:-3000}
+  echo "Waiting for Keel to start (up to 5 minutes)..."
+  for _ in $(seq 1 100); do
+    if curl -fs -m 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then return 0; fi
+    id=$(compose ps -q keel-studio 2>/dev/null | head -n 1)
+    s=""; if [ -n "$id" ]; then s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" 2>/dev/null || true); fi
+    id=$(compose ps -q keel-gateway 2>/dev/null | head -n 1)
+    g=""; if [ -n "$id" ]; then g=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" 2>/dev/null || true); fi
+    if [ "$s" = healthy ] && [ "$g" = healthy ]; then return 0; fi
+    sleep 3
+  done
+  compose ps -a >&2 || true
+  echo "keel: last log lines of the migrations and Studio:" >&2
+  compose logs --tail 20 keel-migrate keel-studio >&2 || true
+  return 1
+}
+
+# Settings newer versions need, added with fresh values from the new image.
+add_missing_settings() {
+  local image=$1 fresh key
+  fresh=$(docker run --rm "$image" generate-env 2>/dev/null) || return 0
+  for key in KEEL_SERVICE_PASSWORD KEEL_FUNCTIONS_TOKEN IMGPROXY_KEY IMGPROXY_SALT; do
+    if [ -z "$(env_get "$key")" ]; then
+      env_set "$key" "$(printf '%s\n' "$fresh" | sed -n "s/^$key=//p")"
+      echo "Added $key to .env"
+    fi
+  done
+}
+
+cmd_update() {
+  local target="" backup=1 compose_new=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) target=${2:-}; shift 2 ;;
+      --no-backup) backup=""; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      # Used by the installer: the new compose file, put in place after the backup.
+      --compose) compose_new=${2:-}; shift 2 ;;
+      *) die "unknown option $1 (use --version V, --no-backup, --yes)" ;;
+    esac
+  done
+  need docker
+  [ -f .env ] || die "no .env yet. Run ./keel init first."
+
+  if is_source; then
+    local from=source
+    if [ -d .git ]; then need git; from=$(git rev-parse --short HEAD); fi
+    [ -z "$target" ] || die "--version is for installed folders; in a copy of the source, check out the version's tag (git checkout v$target)"
+    [ -z "$backup" ] || backup_databases "$from" "new code"
+    if [ -d .git ]; then git pull --ff-only; fi
+    cmd_up
+    echo "Updated from $from. The databases were backed up first; ./keel rollback --restore puts them back."
+    return
+  fi
+
+  local cur prev
+  cur=$(current_version)
+  # An install whose version isn't known keeps its images as "previous" before
+  # anything is downloaded (finding the newest release moves the latest tag).
+  if [ -z "$cur" ]; then snapshot_images; prev=previous; else prev=$cur; fi
+  target=${target#v}
+  [ "$target" != latest ] || target=""
+  if [ -z "$target" ]; then
+    if [ "$(env_get KEEL_VERSION)" = edge ]; then target=edge; else target=$(latest_release); fi
+  fi
+  is_version "$target" || [ "$target" = edge ] || die "--version: use a version such as 0.2.0"
+  if is_version "$cur" && is_version "$target" && version_lt "$target" "$cur"; then
+    die "$target is older than the version running now ($cur). To go back, use ./keel rollback."
+  fi
+  if [ "$target" = "$cur" ] && [ -z "$compose_new" ]; then
+    echo "Keel $cur is already running; restarting it."
+    cmd_up
+    return
+  fi
+
+  local repo
+  repo=$(keel_repo)
+  echo "Updating Keel from ${cur:-an unversioned build} to $target."
+  # Download first: if that fails, nothing has changed.
+  for name in $(keel_images "$repo" "${compose_new:-docker-compose.yml}"); do
+    docker pull -q "$name:$target" >/dev/null || die "could not download $name:$target; nothing was changed"
+  done
+  [ -z "$backup" ] || backup_databases "$prev" "$target"
+  if [ -n "$compose_new" ]; then mv -f "$compose_new" docker-compose.yml; fi
+  add_missing_settings "$repo:$target"
+  # Refreshing the same version (the installer) keeps the recorded previous one.
+  [ "$target" = "$cur" ] || env_set KEEL_PREVIOUS_VERSION "$prev"
+  env_set KEEL_VERSION "$target"
+  # keel-db follows KEEL_VERSION again (see cmd_rollback).
+  [ -z "$(env_get KEEL_DB_VERSION)" ] || env_set KEEL_DB_VERSION ""
+  # The other images (imgproxy; Postgres in older compose files) are pinned in the compose file.
+  compose pull -q --ignore-pull-failures >/dev/null 2>&1 || true
+  if ! compose up -d --remove-orphans || ! wait_healthy; then
+    echo >&2
+    echo "keel: Keel $target didn't start. To go back to $prev, run: ./keel rollback" >&2
+    exit 1
+  fi
+  echo
+  echo "Keel is now $target (was $prev). If something is wrong, ./keel rollback goes back."
+}
+
+cmd_rollback() {
+  local restore="" bset="" now
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --restore) restore=yes; shift ;;
+      --no-restore) restore=no; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      *) die "unknown option $1 (use --restore, --no-restore, --yes)" ;;
+    esac
+  done
+  need docker
+  [ -f .env ] || die "no .env here"
+  bset=$(newest_backup_set)
+
+  local prev="" cur=""
+  if ! is_source; then
+    prev=$(env_get KEEL_PREVIOUS_VERSION)
+    cur=$(env_get KEEL_VERSION)
+    [ -n "$prev" ] || die "no previous version is recorded in .env (KEEL_PREVIOUS_VERSION); updates made with ./keel update record it"
+  fi
+
+  # Did the newer version upgrade the schema? Then the older one won't start
+  # on it (keel-migrate refuses), and the backup has to come back.
+  if [ -z "$restore" ]; then
+    if [ -z "$bset" ]; then
+      echo "No backup from before the update was found in $PRE_UPDATE_DIR. If the newer version" >&2
+      echo "upgraded the database, the older one will refuse to start." >&2
+      restore=no
+    else
+      ensure_db
+      now=$(schema_levels)
+      if [ "$now" = "$(cat "$bset/schema" 2>/dev/null)" ]; then
+        restore=no
+      else
+        echo "Since the backup of $(sed -n 's/^time=//p' "$bset/about") ($bset), the database schema changed:"
+        echo "the newer version upgraded it, so the older one can't run on it."
+        if ask "Restore every database from that backup? Changes made since then are lost." n; then
+          restore=yes
+        else
+          die "nothing was changed. Run ./keel rollback --restore to restore the backup, or stay on this version."
+        fi
+      fi
+    fi
+  elif [ "$restore" = yes ]; then
+    [ -n "$bset" ] || die "there is no backup in $PRE_UPDATE_DIR to restore"
+    echo "This replaces every database with the backup of $(sed -n 's/^time=//p' "$bset/about") ($bset)."
+    ask "Changes made since then are lost. Continue?" n || die "nothing was changed"
+  fi
+
+  if is_source; then
+    [ "$restore" = yes ] && restore_databases "$bset"
+    echo "Check out the code you had before ($(sed -n 's/^from=//p' "$bset/about" 2>/dev/null || echo 'the previous commit')), e.g. git checkout <commit>, then run ./keel up."
+    return
+  fi
+
+  local repo name file=docker-compose.yml db_version=""
+  repo=$(keel_repo)
+  if [ "$restore" = yes ] && [ -f "$bset/docker-compose.yml" ]; then file="$bset/docker-compose.yml"; fi
+  if [ "$prev" != previous ]; then
+    for name in $(keel_images "$repo" "$file"); do
+      if docker pull -q "$name:$prev" >/dev/null || docker image inspect "$name:$prev" >/dev/null 2>&1; then continue; fi
+      # A version from before keel-postgres: keel-db keeps the image it runs
+      # now (the same Postgres major, so the data stays readable).
+      if [ "$name" = "$repo-postgres" ]; then
+        db_version=$(env_get KEEL_DB_VERSION)
+        db_version=${db_version:-${cur:-latest}}
+        continue
+      fi
+      die "could not download $name:$prev; nothing was changed"
+    done
+  else
+    docker image inspect "$repo:previous" >/dev/null 2>&1 || die "the previous images are no longer on this machine"
+    # Kept before keel-postgres existed: keel-db keeps the image it runs now.
+    if grep -q '/keel-postgres:' "$file" 2>/dev/null && ! docker image inspect "$repo-postgres:previous" >/dev/null 2>&1; then
+      db_version=$(env_get KEEL_DB_VERSION)
+      db_version=${db_version:-${cur:-latest}}
+    fi
+  fi
+  if [ "$restore" = yes ]; then
+    restore_databases "$bset"
+    [ ! -f "$bset/docker-compose.yml" ] || cp -p "$bset/docker-compose.yml" docker-compose.yml
+  fi
+  env_set KEEL_VERSION "$prev"
+  env_set KEEL_PREVIOUS_VERSION "$cur"
+  if [ -n "$db_version" ] || [ -n "$(env_get KEEL_DB_VERSION)" ]; then env_set KEEL_DB_VERSION "$db_version"; fi
+  compose up -d --remove-orphans
+  wait_healthy || die "Keel $prev didn't start; see the messages above"
+  echo
+  [ "$prev" != previous ] || prev="the version from before the update"
+  echo "Keel is back on $prev$([ "$restore" = yes ] && echo ", with the databases from $bset")."
+}
+
+# --- Full backups -------------------------------------------------------------
+#
+# ./keel restore --list shows the full backups here and in the off-machine
+# target; ./keel restore <file or name> puts one back: every database and
+# uploaded file of this install is replaced. The passphrase and the target's
+# keys reach the container through the environment, never a command line.
+cmd_restore() {
+  local arg="" list="" verify=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list) list=1; shift ;;
+      --verify) verify=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      -*) die "unknown option $1 (use --list, --verify, --yes)" ;;
+      *) [ -z "$arg" ] || die "one backup at a time"; arg=$1; shift ;;
+    esac
+  done
+  need docker
+  [ -f .env ] || die "no .env here. Install Keel first (a fresh install is fine), then restore into it."
+  [ -n "$list" ] || [ -n "$arg" ] || die "usage: ./keel restore --list | ./keel restore <backup file or name> [--verify] [--yes]"
+
+  local pass k
+  pass=$(env_get KEEL_BACKUP_PASSPHRASE)
+  if [ -z "$pass" ] && [ -z "$list" ]; then
+    if { : </dev/tty; } 2>/dev/null; then
+      printf 'Backup passphrase: ' >/dev/tty
+      IFS= read -rs pass </dev/tty || pass=""
+      echo >/dev/tty
+    fi
+    [ -n "$pass" ] || die "set KEEL_BACKUP_PASSPHRASE in .env to the passphrase the backup was made with"
+  fi
+  export KEEL_BACKUP_PASSPHRASE="$pass"
+  KEEL_SECRET=$(env_get KEEL_SECRET)
+  export KEEL_SECRET
+  local envs=(-e KEEL_BACKUP_PASSPHRASE -e KEEL_SECRET)
+  for k in ENDPOINT REGION BUCKET PREFIX ACCESS_KEY_ID SECRET_ACCESS_KEY PATH_STYLE; do
+    export "KEEL_BACKUP_S3_$k=$(env_get "KEEL_BACKUP_S3_$k")"
+    envs+=(-e "KEEL_BACKUP_S3_$k")
+  done
+
+  ensure_db
+  if [ -n "$list" ]; then
+    keel_run "${envs[@]}" keel-migrate restore --list
+    return
+  fi
+
+  # A file on this machine is mounted into the container; anything else is a name.
+  local mounts=() target=$arg file
+  file=$(abs_path "$arg")
+  if [ -f "$file" ]; then
+    mounts=(-v "$(host_dir "$(dirname "$file")")/$(basename "$file"):/restore/backup.tar.age:ro")
+    target=/restore/backup.tar.age
+    # Its own name, so the restore can warn when it doesn't match the backup inside.
+    KEEL_RESTORE_NAME=$(basename "$file")
+    export KEEL_RESTORE_NAME
+    envs+=(-e KEEL_RESTORE_NAME)
+  fi
+  keel_run ${mounts[@]+"${mounts[@]}"} "${envs[@]}" keel-migrate restore "$target" --verify-only \
+    || die "nothing was changed"
+  [ -z "$verify" ] || return 0
+
+  echo
+  echo "This replaces every database and uploaded file of this Keel with the backup."
+  ask "Everything changed here since the backup was made is lost. Continue?" n || die "nothing was changed"
+  # A name was downloaded into backups/full by the check above.
+  echo "Stopping Keel ..."
+  compose stop >/dev/null
+  ensure_db
+  keel_run ${mounts[@]+"${mounts[@]}"} "${envs[@]}" keel-migrate restore "$target" --checked \
+    || die "the restore stopped part way. Fix the problem above and run ./keel restore again; Keel stays stopped until then."
+  echo "Starting Keel ..."
+  compose up -d --remove-orphans
+  wait_healthy || die "Keel didn't start after the restore; see the messages above"
+  echo
+  echo "Restored. Apps keep working with the same API keys, and Studio has the accounts from the backup."
+  echo "If KEEL_SECRET in .env differs from the old server's, Studio two-factor sign-in and a target saved"
+  echo "in Studio need setting up again; a Cloudflare tunnel token needs pasting again in Studio."
+}
+
+cmd_version() {
+  local v
+  if is_source; then
+    echo "Source checkout: $( (git describe --tags --always 2>/dev/null) || echo unknown)"
+  else
+    v=$(current_version)
+    echo "Keel ${v:-unknown} (KEEL_VERSION=$(env_get KEEL_VERSION))"
+    [ -z "$(env_get KEEL_PREVIOUS_VERSION)" ] || echo "Previous: $(env_get KEEL_PREVIOUS_VERSION) (./keel rollback)"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: ./keel <command>
+
+  init [--url URL] [--project NAME]   Create .env with random secrets. Studio and
+       [--lan] [--lan-db]             Postgres listen on this machine only; --lan
+                                      opens Studio, --lan-db Postgres to your network
+  up                                  Build (if needed) and start the stack
+  down                                Stop the stack (data is kept)
+  ps                                  Show container status
+  logs [service]                      Follow logs (e.g. ./keel logs keel-auth)
+  psql [project]                      psql into a project's database (default: KEEL_DEFAULT_PROJECT)
+  functions deploy [name ...]         Deploy edge functions from ./supabase/functions
+            [--project P] [--dir PATH] [--no-verify-jwt]
+  functions list|delete [name]        List or delete deployed functions
+  secrets set NAME=value ...          Set environment variables for functions
+          [--env-file FILE] [--project P]   (also: secrets list, secrets unset NAME)
+  import-supabase --db-url URL        Copy a Supabase project (tables, users, files)
+          [--url URL --service-key KEY] [--project P]   into a Keel project
+  studio-user list|add|reset-password|reset-2fa|remove [name]
+                                      Manage Studio accounts (recovery, lost phone)
+  keys list|roll|revoke-old <project>  Show or roll a project's API keys. roll keeps
+       [--grace HOURS] [--emergency --yes]  old keys working 24 hours (--grace);
+                                      --emergency stops them now and signs users out
+  update [--version V] [--no-backup]  Back up every database, then move to the newest
+                                      release (or version V) and restart
+  rollback [--restore]                Go back to the version before the last update;
+                                      --restore also puts back the databases from
+                                      the backup taken before it
+  restore --list                      Show the full backups here and in the backup target
+  restore <file or name> [--verify]   Replace every database and uploaded file with a
+          [--yes]                     full backup (--verify only checks it can be opened)
+  version                             Show the version running and the previous one
+EOF
+}
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  up) shift; cmd_up "$@" ;;
+  down) shift; compose down "$@" ;;
+  ps) compose ps ;;
+  logs) shift; compose logs -f --tail=200 "$@" ;;
+  psql) shift; cmd_psql "$@" ;;
+  functions|fn) shift; cmd_functions "$@" ;;
+  secrets) shift; cmd_secrets "$@" ;;
+  studio-user) shift; keel_run keel-migrate studio-user "$@" ;;
+  keys) shift; keel_run keel-migrate keys "$@" ;;
+  import-supabase) shift; cmd_import_supabase "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  rollback) shift; cmd_rollback "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  version|--version) cmd_version ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

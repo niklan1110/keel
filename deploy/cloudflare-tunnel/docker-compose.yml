@@ -1,0 +1,37 @@
+# Cloudflare Tunnel for Keel: publishes Keel at your own domain without opening
+# any port on your router. Run it next to Keel on the same machine.
+#
+# It joins only Keel's "keel-public" network, which holds just keel-gateway (the
+# API) and keel-studio, so the tunnel can reach those two and nothing else on
+# this machine: not your other apps, not Postgres.
+#
+# In Cloudflare (Zero Trust > Networks > Tunnels), route your hostnames to:
+#   api.example.com     ->  http://keel-gateway:8000
+#   studio.example.com  ->  http://keel-studio:3000   (optional; protect it with Cloudflare Access)
+#
+# Start Keel first (the network is created with it), then this stack.
+name: keel-tunnel
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+    command: ["tunnel", "--no-autoupdate", "run"]
+    restart: unless-stopped
+    environment:
+      # The token from Cloudflare: the long value after --token in the install
+      # command it shows when you create the tunnel.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Paste the tunnel token from Cloudflare}
+    networks:
+      keel-public:
+        # Keel trusts the visitor addresses a proxy by this name passes on.
+        aliases: [keel-tunnel]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    labels:
+      keel.role: Tunnel
+
+networks:
+  keel-public:
+    name: keel-public
+    external: true

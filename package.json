@@ -1,0 +1,24 @@
+{
+  "name": "keel",
+  "private": true,
+  "version": "0.3.1",
+  "description": "Keel: a self-hosted, Supabase-compatible backend (Postgres, REST, auth, storage, realtime) with a studio, packaged for Docker.",
+  "license": "MIT",
+  "workspaces": [
+    "server",
+    "studio",
+    "website",
+    "tests/e2e"
+  ],
+  "scripts": {
+    "build": "npm run build -w server && npm run build -w studio && npm run build -w website",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w studio",
+    "test": "npm test -w server",
+    "test:e2e": "npm test -w tests/e2e",
+    "dev:studio": "npm run dev -w studio",
+    "dev:docs": "npm run dev -w website"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

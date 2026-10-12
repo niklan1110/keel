@@ -1,0 +1,34 @@
+#!/bin/sh
+# Stands in for docker in the installer tests (CI runners on macOS have no
+# Docker): answers the calls install.sh makes, starts nothing, and logs each
+# call to $FAKE_DOCKER_LOG. Plain POSIX sh.
+echo "docker $*" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+case "${1:-}" in
+  --version) echo "Docker version 27.0.0, build fake" ;;
+  info) echo "linux" ;;
+  compose)
+    case "${2:-}" in
+      version) echo "Docker Compose version v2.30.0" ;;
+      ps) [ "${3:-}" = -q ] && echo "fake0000container" ;;
+      up|pull|logs|config|down|stop) ;;
+      *) echo "fake docker: unexpected compose call: $*" >&2; exit 1 ;;
+    esac ;;
+  pull|tag) ;;
+  ps) ;;
+  inspect) echo healthy ;;
+  image) [ "${2:-}" = inspect ] && echo "0.0.1-test" ;;
+  volume) exit 1 ;;
+  run)
+    case " $* " in
+      *" generate-env "*)
+        printf '%s\n' POSTGRES_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef \
+          KEEL_SERVICE_PASSWORD=fedcba9876543210fedcba9876543210fedcba9876543210 \
+          KEEL_SECRET=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff \
+          KEEL_FUNCTIONS_TOKEN=ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100 \
+          KEEL_DASHBOARD_PASSWORD=FakePassword12345678 \
+          IMGPROXY_KEY=aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00 \
+          IMGPROXY_SALT=bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11 ;;
+      *) echo "fake docker: unexpected run: $*" >&2; exit 1 ;;
+    esac ;;
+  *) echo "fake docker: unexpected call: $*" >&2; exit 1 ;;
+esac

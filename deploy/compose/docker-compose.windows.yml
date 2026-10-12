@@ -1,0 +1,20 @@
+# Keel on Windows with Docker Desktop: used together with docker-compose.yml.
+# The Windows installer lists both in COMPOSE_FILE in .env, so `keel` and
+# plain `docker compose` commands in the install folder use them together.
+#
+# Postgres keeps its data in a Docker volume (inside Docker Desktop's Linux
+# disk) instead of the install folder: through Docker Desktop's file sharing a
+# database on a Windows drive is several times slower and less safe in a
+# crash. Everything else (uploads, backups, functions, settings) stays in the
+# install folder, where Explorer and your backup tool can see it.
+#
+# Removing the volume deletes every database: never run `docker compose down -v`
+# here unless that is what you want. The nightly dumps in backups\ and the ones
+# `keel update` takes are your copies.
+services:
+  keel-db:
+    volumes:
+      - db:/var/lib/postgresql/data
+
+volumes:
+  db:

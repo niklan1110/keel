@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+.git
+.env
+docs
+tests/e2e/node_modules
+packages
+*.md
+!website/**/*.md
+website/.vitepress/cache
+backups
