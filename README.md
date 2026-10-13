@@ -22,7 +22,6 @@
 [Features](#features) ·
 [Keel and Supabase](#keel-and-supabase) ·
 [Security](#security) ·
-[Architecture](#architecture) ·
 [Docs](#documentation) ·
 [Roadmap](#roadmap)
 
@@ -64,21 +63,27 @@ const { data } = await keel.from('recipes').select('title, author:profiles(displ
 <tr>
 <td width="33%" valign="top">
 
-**🔌 Speaks Supabase**
+<img src=".github/assets/icon-supabase.svg" width="40" height="40" alt="">
+
+**Speaks Supabase**
 
 The same HTTP and WebSocket APIs, the same client, the same row level security patterns. Every change is tested against a running server with `supabase-js` v2.
 
 </td>
 <td width="33%" valign="top">
 
-**🏠 Your data, your hardware**
+<img src=".github/assets/icon-hardware.svg" width="40" height="40" alt="">
+
+**Your data, your hardware**
 
 One machine: a home server, a NAS, a mini PC or a Raspberry Pi, in 1 to 2 GB of RAM. Apart from a daily check for new releases (which you can turn off), nothing leaves it unless you ask.
 
 </td>
 <td width="33%" valign="top">
 
-**🛡️ Safe by default**
+<img src=".github/assets/icon-safe.svg" width="40" height="40" alt="">
+
+**Safe by default**
 
 Row level security on every new table, Studio and Postgres closed to the network until you open them, sandboxed functions and outgoing requests, and signed release images.
 
@@ -87,21 +92,27 @@ Row level security on every new table, Studio and Postgres closed to the network
 <tr>
 <td valign="top">
 
-**🧭 Vectors and maps**
+<img src=".github/assets/icon-vectors.svg" width="40" height="40" alt="">
+
+**Vectors and maps**
 
 The `keel-postgres` image is Postgres 17 with **pgvector** for embeddings and nearest-neighbour search, and **PostGIS** for geometry, geography and GeoJSON.
 
 </td>
 <td valign="top">
 
-**⏰ Jobs and webhooks**
+<img src=".github/assets/icon-jobs.svg" width="40" height="40" alt="">
+
+**Jobs and webhooks**
 
 `cron.schedule` and `net.http_post` in every project, plus Supabase's database webhooks. Requests go out through `keel-egress`, a sandboxed sender that can't reach your network.
 
 </td>
 <td valign="top">
 
-**💾 Backups that leave the house**
+<img src=".github/assets/icon-backups.svg" width="40" height="40" alt="">
+
+**Backups that leave the house**
 
 Encrypted full backups (age format) of every database, setting and uploaded file, copied to any S3-compatible bucket. `./keel restore` rebuilds a whole install on a new machine.
 
@@ -112,6 +123,13 @@ Encrypted full backups (age format) of every database, setting and uploaded file
 <p align="right"><a href="#readme-top">↑ back to top</a></p>
 
 ## Quick start
+
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/platforms-dark.svg">
+  <img alt="Runs on Linux, Windows, macOS, NAS, Raspberry Pi and Docker" src=".github/assets/platforms-light.svg" width="100%">
+</picture>
+</p>
 
 You need Docker with the Compose plugin (`docker compose version` prints v2 or newer). Each release has its own installer with a SHA-256 checksum. On Linux, macOS or a NAS, download it, check it, then run it:
 
@@ -247,20 +265,11 @@ Studio is at `http://localhost:3000`. To set up the published compose file by ha
 
 Each project gets its own database, API keys, users, buckets and URL, side by side on one server.
 
-<table>
-<tr>
-<td width="62%" valign="top">
-<img src=".github/assets/studio-sql.png" alt="Studio's SQL editor with a query and its results next to the schema canvas">
-<p align="center"><sub>SQL editor with saved queries</sub></p>
-<img src="website/public/images/studio-connect-agent.png" alt="Studio's Connect drawer with the API URL, keys and a prompt for coding agents">
-<p align="center"><sub>Connect: URLs, keys and an agent prompt</sub></p>
-</td>
-<td width="38%" valign="top">
-<img src=".github/assets/studio-phone.png" alt="Studio on a phone, showing project stats, the stack and the schema">
-<p align="center"><sub>Studio on a phone</sub></p>
-</td>
-</tr>
-</table>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/showcase-dark.png">
+  <img alt="Keel Studio: the SQL editor and the Connect panel in a browser, and the project overview on a phone" src=".github/assets/showcase-light.png" width="100%">
+</picture>
+<p align="center"><sub>Studio: SQL editor, the Connect panel with keys and an agent prompt, and the phone view</sub></p>
 
 <p align="right"><a href="#readme-top">↑ back to top</a></p>
 
@@ -379,45 +388,7 @@ Read the [security guide](website/self-hosting/security.md) before putting Keel 
 
 <p align="right"><a href="#readme-top">↑ back to top</a></p>
 
-## Architecture
-
-```mermaid
-flowchart TB
-    apps["Apps<br/>supabase-js · curl · psql"]
-    browser["Browser"]
-    web(["The internet<br/>webhooks, APIs"])
-
-    apps -- ":8000" --> gateway["keel-gateway<br/>routes /project/…, API keys, CORS"]
-    browser -- ":3000" --> studio["keel-studio<br/>dashboard, admin API, backups, cron"]
-    studio --> docker["keel-docker<br/>socket proxy"]
-
-    gateway --> rest["keel-rest<br/>PostgREST per project"]
-    gateway --> auth["keel-auth"]
-    gateway --> storage["keel-storage"]
-    gateway --> realtime["keel-realtime"]
-    gateway --> functions["keel-functions<br/>Deno, one process per function"]
-    storage --> imgproxy["keel-imgproxy"]
-
-    rest --> db[("keel-db · keel-postgres<br/>Postgres 17 + pgvector, PostGIS<br/>one database per project")]
-    auth --> db
-    storage --> db
-    realtime --> db
-    studio --> db
-
-    db -- "queued requests" --> egress["keel-egress<br/>sends HTTP from SQL, sandboxed"]
-    egress --> web
-    egress -. "own edge functions" .-> gateway
-
-    tunnel["keel-tunnel<br/>Cloudflare, optional"] -.-> gateway
-    tunnel -.-> studio
-```
-
-Auth, storage, realtime and the egress sender are written for Keel in TypeScript and follow the Supabase Auth (GoTrue), Storage, Realtime and `pg_net` APIs. `keel-migrate` runs at startup to create roles and upgrade every project's schema. More in [docs/architecture.md](docs/architecture.md) and the [architecture reference](website/reference/architecture.md).
-
-<details>
-<summary><b>Built with</b></summary>
-
-<br>
+## Built with
 
 <p align="center">
 <a href="https://www.postgresql.org"><img src="https://img.shields.io/badge/PostgreSQL%2017-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL 17"></a>
@@ -445,8 +416,6 @@ Auth, storage, realtime and the egress sender are written for Keel in TypeScript
 <a href="website/auth/oidc.md"><img src="https://img.shields.io/badge/Keycloak-4D4D4D?logo=keycloak&logoColor=white" alt="Keycloak"></a>
 <a href="website/auth/oidc.md"><img src="https://img.shields.io/badge/Authelia-113155?logo=authelia&logoColor=white" alt="Authelia"></a>
 </p>
-
-</details>
 
 <p align="right"><a href="#readme-top">↑ back to top</a></p>
 
