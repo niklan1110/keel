@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest something Keel should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The problem or use case, rather than the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could work
+      description: If Supabase has this, a link to its docs helps; Keel follows Supabase's APIs.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead

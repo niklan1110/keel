@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="56" fill="#141414"/>
+  <text x="44" y="166" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="104" font-weight="700" letter-spacing="-6" fill="#ffffff">keel</text>
+  <circle cx="208" cy="158" r="12" fill="#f0522e"/>
+</svg>

@@ -1,0 +1,61 @@
+# Keel on a small machine: a Raspberry Pi or a NAS with 1-2 GB of RAM.
+#
+# Caps each container's memory, so one busy service can't push the whole
+# machine into swap or get Postgres killed, and gives Postgres smaller buffers.
+# Use it next to Keel's compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.small.yml up -d
+#
+# or, so that ./keel and plain `docker compose` always use it, add this line to
+# .env (on Windows, separate the files with ; instead of :):
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.small.yml
+#
+# From a copy of the source, the file is deploy/compose/docker-compose.small.yml.
+# The limits add up to about 1.3 GB in the worst case; idle, Keel uses far less.
+# Raise a limit if `docker compose ps` shows a service restarting, or if its
+# log ends with "out of memory".
+services:
+  keel-db:
+    mem_limit: 512m
+    environment:
+      # Postgres' memory: shared buffers, per-sort memory, maintenance and the
+      # write-ahead log kept on disk. No parallel query workers.
+      KEEL_DB_SETTINGS: >-
+        shared_buffers=64MB
+        effective_cache_size=256MB
+        work_mem=2MB
+        maintenance_work_mem=32MB
+        max_wal_size=256MB
+        min_wal_size=64MB
+        autovacuum_max_workers=2
+        max_parallel_workers_per_gather=0
+
+  keel-rest:
+    # One PostgREST process per project, about 30 MB each.
+    mem_limit: 256m
+  keel-auth:
+    mem_limit: 160m
+  keel-realtime:
+    mem_limit: 160m
+  keel-storage:
+    mem_limit: 192m
+  keel-gateway:
+    mem_limit: 160m
+  keel-studio:
+    # Backups and imports run pg_dump and pg_restore inside Studio.
+    mem_limit: 320m
+  keel-imgproxy:
+    mem_limit: 192m
+    environment:
+      # One image at a time.
+      IMGPROXY_WORKERS: "1"
+  keel-egress:
+    # Outgoing requests from SQL: up to 8 at once, responses up to 1 MB.
+    mem_limit: 128m
+  keel-functions:
+    mem_limit: 512m
+    environment:
+      # At most 3 functions at once, 128 MB each.
+      KEEL_FUNCTIONS_MEMORY_MB: "128"
+      KEEL_FUNCTIONS_MAX_WORKERS: "3"

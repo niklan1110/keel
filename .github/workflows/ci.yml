@@ -1,0 +1,160 @@
+name: CI
+
+# Builds and tests Keel: typecheck, unit tests, Studio and website builds,
+# shell script checks, then the whole stack with the end-to-end tests.
+#
+# Runs on pull requests and on pushes to any branch. Pushes to the default
+# branch and version tags are tested by the release workflow, which calls this
+# one before it publishes anything (so they aren't tested twice).
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  workflow_call:
+    inputs:
+      called:
+        description: Set by the release workflow.
+        type: boolean
+        default: true
+
+# Read-only token: CI only builds and tests.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: inputs.called || github.event_name != 'push' || github.ref_name != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # No lifecycle scripts, as in the Dockerfile: no dependency needs one.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build -w studio
+      - run: npm run build -w website   # fails on dead links
+
+      - name: Shell scripts
+        run: shellcheck keel deploy/install.sh tests/installer/test-install-sh.sh tests/installer/check-compose-sync.sh tests/installer/fake-docker/docker
+
+      - name: Compose files in step (services, pinned images, NAS file)
+        run: bash tests/installer/check-compose-sync.sh
+
+      - name: Images are pinned, and keel-db matches the image's Postgres
+        run: |
+          # Every base image in the Dockerfile is pinned by digest (or is an
+          # earlier stage, or scratch).
+          awk '/^FROM / {
+                 i = ($2 ~ /^--platform=/) ? 3 : 2; img = $i
+                 at = index(img, "@sha256:"); d = at ? substr(img, at + 8) : ""
+                 if (img != "scratch" && !(img in stage) && !(d ~ /^[0-9a-f]+$/ && length(d) == 64)) { print "Dockerfile:" NR ": " $0; bad = 1 }
+                 if (toupper($(i + 1)) == "AS") stage[$(i + 2)] = 1
+               }
+               END { exit bad }' Dockerfile \
+            || { echo "::error file=Dockerfile::pin every base image by digest"; exit 1; }
+          # keel-postgres (keel-db) and the keel image (pg_dump for backups) both
+          # start from the one Postgres image, so they always have the same version.
+          if [ "$(grep -c '^FROM postgres:' Dockerfile)" != 1 ] || ! grep -q '^FROM postgres:[^ ]* AS postgres$' Dockerfile; then
+            echo "::error file=Dockerfile::exactly one Postgres base image, as the stage 'postgres'"; exit 1
+          fi
+          for stage in pgbase db-build db; do
+            grep -q "^FROM postgres AS $stage\$" Dockerfile || { echo "::error file=Dockerfile::stage $stage must start FROM postgres"; exit 1; }
+          done
+          # keel-db runs keel-postgres everywhere, never another Postgres image.
+          for f in docker-compose.yml deploy/compose/docker-compose.yml deploy/zimaos/docker-compose.yml; do
+            grep -A1 '^  keel-db:$' "$f" | grep -q 'image: .*keel-postgres' \
+              || { echo "::error file=$f::keel-db must run the keel-postgres image"; exit 1; }
+            if grep -nE '^\s*image:\s*"?(docker\.io/)?(library/)?postgres[:@]' "$f"; then
+              echo "::error file=$f::use keel-postgres, not the postgres image"; exit 1
+            fi
+          done
+          grep -A4 '^  keel-db:$' docker-compose.yml | grep -q 'target: db' \
+            || { echo "::error file=docker-compose.yml::keel-db must build the Dockerfile's db target"; exit 1; }
+
+      - name: Start the stack
+        run: |
+          ./keel init --url http://localhost:8000
+          # The runner is a cloud VM, so init chose KEEL_EXPOSURE=internet and
+          # sign-ups would start off. Clear it so the address decides, as at home.
+          sed -i 's/^KEEL_EXPOSURE=.*/KEEL_EXPOSURE=/' .env
+          # Full backups on, so their end-to-end tests run.
+          echo "KEEL_BACKUP_PASSPHRASE=$(openssl rand -hex 16)" >> .env
+          docker compose build
+          docker compose up -d
+          # An S3-compatible server for the backup upload test (KEEL_E2E_S3 below).
+          docker run -d --name keel-e2e-s3 --network keel_default \
+            -e ROOT_ACCESS_KEY=e2eaccess -e ROOT_SECRET_KEY=e2esecret123 \
+            versity/versitygw:v1.8.0 posix /tmp
+          docker exec keel-e2e-s3 mkdir -p /tmp/keel-e2e
+          for _ in $(seq 1 90); do
+            if curl -fs http://localhost:8000/health >/dev/null && curl -fs http://localhost:3000/health >/dev/null \
+               && curl -fs http://localhost:8000/my-app/auth/v1/.well-known/jwks.json >/dev/null; then
+              echo "stack is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "stack did not come up"; exit 1
+
+      - name: End-to-end tests
+        env:
+          KEEL_E2E_S3: http://e2eaccess:e2esecret123@keel-e2e-s3:7070/keel-e2e
+        run: npm run test:e2e
+
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --no-color --tail=300
+
+  # install.sh end to end with a stand-in docker: on macOS with its own bash
+  # 3.2 and BSD tools (the runners there have no Docker), and on Linux.
+  installer-unix:
+    if: inputs.called || github.event_name != 'push' || github.ref_name != github.event.repository.default_branch
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: install.sh
+        run: BASH_UNDER_TEST=/bin/bash /bin/bash tests/installer/test-install-sh.sh
+
+  # install.ps1 end to end in Windows PowerShell 5.1 with a stand-in docker
+  # (the runners have no Linux containers), and PSScriptAnalyzer on both scripts.
+  installer-windows:
+    if: inputs.called || github.event_name != 'push' || github.ref_name != github.event.repository.default_branch
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: install.ps1
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\installer\test-install-ps1.ps1
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.23.0 -Scope CurrentUser -Force
+          $findings = Invoke-ScriptAnalyzer -Path deploy -Recurse -Settings deploy/PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message | Out-String -Width 200
+          if ($findings) { exit 1 }

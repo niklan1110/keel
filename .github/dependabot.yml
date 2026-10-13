@@ -1,0 +1,67 @@
+# Keeps dependencies current with weekly pull requests: npm packages, the
+# GitHub Actions (pinned by commit SHA in the workflows) and the container
+# images (pinned by digest in the Dockerfile and the compose files).
+version: 2
+
+# Image updates from the Dockerfile and the compose files arrive in one pull
+# request. The Postgres image is only in the Dockerfile: keel-postgres (keel-db)
+# and the keel image (pg_dump) both start from it.
+multi-ecosystem-groups:
+  images:
+    schedule:
+      interval: weekly
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    ignore:
+      # Node's types follow the Node version Keel runs on (22), which is
+      # changed by hand together with the node images above.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    multi-ecosystem-group: images
+    patterns: ["*"]
+    ignore:
+      # A new Postgres major needs a data upgrade; a new Node major is a
+      # deliberate change. Both are done by hand.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+      # PostgREST is pinned to the major version Supabase runs, so the REST API
+      # behaves the same; moving it is a tested, deliberate change.
+      - dependency-name: postgrest/postgrest
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: docker-compose
+    directories:
+      - /
+      - /deploy/compose
+      - /deploy/zimaos
+      - /deploy/cloudflare-tunnel
+    multi-ecosystem-group: images
+    patterns: ["*"]
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      # A new imgproxy major can change its settings and URL format; it is
+      # moved by hand, with the image transformation tests.
+      - dependency-name: darthsim/imgproxy
+        update-types: ["version-update:semver-major"]

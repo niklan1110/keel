@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in Keel doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Security problems don't belong here**: report them privately (see SECURITY.md).
+        Please leave out passwords, keys, tokens, real email addresses and your server's public address.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create a project ...
+        2. Call ... with supabase-js
+        3. See the error ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Keel version
+      description: From `./keel version`, or Studio > Project settings.
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How Keel is installed
+      options:
+        - Installer (Linux)
+        - Installer (macOS)
+        - Installer (Windows, WSL 2)
+        - Installer (NAS: Synology, Unraid, TrueNAS, ...)
+        - ZimaOS / CasaOS App Store
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines from `./keel logs <service>` (check them for personal data first).
+      render: text

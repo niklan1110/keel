@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="t d">
+  <title id="t">Keel</title>
+  <desc id="d">Keel: the self-hosted backend that speaks Supabase. Postgres with pgvector and PostGIS, REST, auth, storage, realtime, edge functions, scheduled jobs, encrypted backups and a dashboard.</desc>
+  <defs>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#2b2d31"/>
+    </pattern>
+    <linearGradient id="fade" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#0f0f10" stop-opacity="1"/>
+      <stop offset="0.45" stop-color="#0f0f10" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#0f0f10" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#141414" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="360" rx="20" fill="#0f0f10"/>
+  <rect width="1280" height="360" rx="20" fill="url(#dots)"/>
+  <rect width="760" height="360" fill="url(#fade)"/>
+  <rect x="0.5" y="0.5" width="1279" height="359" rx="19.5" fill="none" stroke="#2b2d31"/>
+
+  <g font-family="'Bricolage Grotesque', 'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif">
+    <!-- Logo mark -->
+    <g transform="translate(72 84)">
+      <rect width="64" height="64" rx="14" fill="#141414" stroke="#3a3c41"/>
+      <circle cx="48" cy="16" r="5" fill="#f0522e"/>
+      <text x="32" y="47" text-anchor="middle" font-size="40" font-weight="700" fill="#ffffff">k</text>
+    </g>
+    <!-- Wordmark -->
+    <text x="156" y="138" font-size="72" font-weight="700" letter-spacing="-3" fill="#ffffff">keel<tspan fill="#f0522e">.</tspan></text>
+
+    <text x="72" y="208" font-size="30" font-weight="600" letter-spacing="-0.6" fill="#ffffff">The self-hosted backend that speaks Supabase.</text>
+    <text x="72" y="248" font-size="19" fill="#a3a6ad">Postgres 17, REST, auth, storage, realtime, edge functions and a dashboard,</text>
+    <text x="72" y="276" font-size="19" fill="#a3a6ad">on your own server, NAS or Raspberry Pi.</text>
+  </g>
+
+  <!-- Feature chips -->
+  <g font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+    <rect x="72" y="304" width="214" height="28" rx="14" fill="#1a1b1e" stroke="#3a6b55"/>
+    <circle cx="89" cy="318" r="4" fill="#3fcf8e"/>
+    <text x="187.5" y="322.5" text-anchor="middle" fill="#e6e6e3">supabase-js compatible</text>
+    <rect x="296" y="304" width="168" height="28" rx="14" fill="#1a1b1e" stroke="#2b2d31"/>
+    <text x="380" y="322.5" text-anchor="middle" fill="#e6e6e3">pgvector · PostGIS</text>
+    <rect x="474" y="304" width="146" height="28" rx="14" fill="#1a1b1e" stroke="#2b2d31"/>
+    <text x="547" y="322.5" text-anchor="middle" fill="#e6e6e3">cron · webhooks</text>
+    <rect x="630" y="304" width="162" height="28" rx="14" fill="#1a1b1e" stroke="#2b2d31"/>
+    <text x="711" y="322.5" text-anchor="middle" fill="#e6e6e3">encrypted backups</text>
+  </g>
+
+  <!-- Schema canvas motif -->
+  <g font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+    <path d="M1018 131 C 1062 131, 1038 227, 1082 227" fill="none" stroke="#5c5f66" stroke-width="1.5"/>
+    <circle cx="1018" cy="131" r="3" fill="#767a82"/>
+    <circle cx="1082" cy="227" r="3" fill="#767a82"/>
+
+    <g filter="url(#shadow)">
+      <rect x="818" y="62" width="200" height="164" rx="12" fill="#1a1b1e" stroke="#2b2d31"/>
+    </g>
+    <rect x="834" y="80" width="14" height="11" rx="2" fill="none" stroke="#f0522e" stroke-width="1.6"/>
+    <line x1="834" y1="85.5" x2="848" y2="85.5" stroke="#f0522e" stroke-width="1.4"/>
+    <text x="858" y="91" font-weight="500" fill="#f5f6f7">profiles</text>
+    <line x1="818" y1="106" x2="1018" y2="106" stroke="#2b2d31"/>
+    <text x="834" y="136" font-size="11" fill="#f0522e">PK</text>
+    <text x="860" y="136" fill="#e6e6e3">id</text><text x="1002" y="136" text-anchor="end" fill="#767a82">uuid</text>
+    <text x="860" y="164" fill="#e6e6e3">name</text><text x="1002" y="164" text-anchor="end" fill="#767a82">text</text>
+    <text x="860" y="192" fill="#e6e6e3">avatar</text><text x="1002" y="192" text-anchor="end" fill="#767a82">text</text>
+
+    <g filter="url(#shadow)">
+      <rect x="1082" y="130" width="160" height="164" rx="12" fill="#1a1b1e" stroke="#f0522e" stroke-width="1.5"/>
+    </g>
+    <rect x="1098" y="148" width="14" height="11" rx="2" fill="none" stroke="#f0522e" stroke-width="1.6"/>
+    <line x1="1098" y1="153.5" x2="1112" y2="153.5" stroke="#f0522e" stroke-width="1.4"/>
+    <text x="1122" y="159" font-weight="500" fill="#f5f6f7">todos</text>
+    <line x1="1082" y1="174" x2="1242" y2="174" stroke="#2b2d31"/>
+    <text x="1098" y="204" font-size="11" fill="#f0522e">PK</text>
+    <text x="1122" y="204" fill="#e6e6e3">id</text><text x="1228" y="204" text-anchor="end" fill="#767a82">int8</text>
+    <text x="1098" y="232" font-size="11" fill="#5b9ae6">FK</text>
+    <text x="1122" y="232" fill="#e6e6e3">user_id</text><text x="1228" y="232" text-anchor="end" fill="#767a82">uuid</text>
+    <text x="1122" y="260" fill="#e6e6e3">done</text><text x="1228" y="260" text-anchor="end" fill="#767a82">bool</text>
+  </g>
+</svg>
