@@ -10,7 +10,6 @@
 
 <br>
 
-[![CI](https://github.com/niklan1110/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/niklan1110/keel/actions/workflows/ci.yml)
 [![Release](https://github.com/niklan1110/keel/actions/workflows/release.yml/badge.svg)](https://github.com/niklan1110/keel/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/niklan1110/keel?label=release&color=f0522e)](https://github.com/niklan1110/keel/releases/latest)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-141414)](LICENSE)
